@@ -519,6 +519,12 @@ int ds4_gpu_warm_command_queue(void);
  * pair: low projection for groups [group0, group0+group_cnt) plus the
  * matching k-slice of the expand projection, producing this rank's partial
  * attention block output (n_tokens == 1 only). */
+int ds4_gpu_dsv41_tp_pack_f16(ds4_gpu_tensor *x, ds4_gpu_tensor *packed, uint32_t rows, uint32_t width);
+int ds4_gpu_dsv41_tp_add_f16(ds4_gpu_tensor *x, ds4_gpu_tensor *peer, uint32_t rows, uint32_t width);
+int ds4_gpu_matmul_q8_0_kslice_batch_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                            uint64_t weight_offset, uint64_t full_in, uint64_t k_off,
+                                            uint64_t k_len, uint64_t out_dim,
+                                            const ds4_gpu_tensor *x, uint32_t n_tok);
 int ds4_gpu_matmul_q8_0_kslice_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,

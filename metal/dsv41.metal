@@ -1095,3 +1095,53 @@ kernel void kernel_dsv41_add_bf16_rows4(
     bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
     out[gid] = bits & 0xffff0000u;
 }
+
+// TP big gates in scaled FP16: each row's partial over a power-of-two scale
+// that puts its largest magnitude below 2^15, rounded to FP16 and kept in
+// place, so both ranks add the same two values. The packed buffer holds the
+// rows' FP16 words, then one float scale per row.
+struct ds4_metal_args_dsv41_tp_f16 { uint width, rows; };
+
+kernel void kernel_dsv41_tp_pack_f16(
+        constant ds4_metal_args_dsv41_tp_f16 &args,
+        device float *x, device half *packed,
+        threadgroup float *shmem [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    device float *xr = x + (ulong)row * args.width;
+    float amax = 0.0f;
+    for (uint i = tid; i < args.width; i += nth) amax = max(amax, abs(xr[i]));
+    amax = simd_max(amax);
+    if (lane == 0) shmem[sg] = amax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float v = lane < (nth + 31u) / 32u ? shmem[lane] : 0.0f;
+        v = simd_max(v);
+        if (lane == 0) shmem[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    amax = shmem[0];
+    int e = 0;
+    if (amax > 0.0f && isfinite(amax)) { frexp(amax, e); e -= 15; }
+    const float scale = ldexp(1.0f, e), inv = ldexp(1.0f, -e);
+    device half *pr = packed + (ulong)row * args.width;
+    for (uint i = tid; i < args.width; i += nth) {
+        const half h = (half)(xr[i] * inv);
+        pr[i] = h;
+        xr[i] = (float)h * scale;
+    }
+    if (tid == 0) ((device float *)(packed + (ulong)args.rows * args.width))[row] = scale;
+}
+
+// x (this rank's rounded partial) + the peer's scaled FP16 partial.
+kernel void kernel_dsv41_tp_add_f16(
+        constant ds4_metal_args_dsv41_tp_f16 &args,
+        device float *x, device const half *peer,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.rows * args.width) return;
+    const float scale = ((device const float *)(peer + (ulong)args.rows * args.width))[gid / args.width];
+    x[gid] = x[gid] + (float)peer[gid] * scale;
+}
