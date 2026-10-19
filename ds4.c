@@ -40955,6 +40955,7 @@ typedef struct {
     uint32_t verify_rows;            /* nonzero while a verify pass runs */
     double plain_rate, draft_rate;   /* tokens per second of plain and proposing cycles */
     uint32_t skip_left, skip_len;    /* proposals skipped while drafting loses */
+    uint32_t deferred;               /* captured rows from mh_pos0 not yet in the rings */
     uint32_t losing;                 /* consecutive proposing cycles below the plain rate */
     ds4_gpu_tensor *mh;              /* [window][n_target * dim] */
     ds4_gpu_tensor *pending;         /* [n_stage][window][512] */
@@ -43399,6 +43400,23 @@ static uint32_t ds41_decode_flush_layers(void) {
     return (uint32_t)cached;
 }
 
+static bool ds41_draft_defer_on(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("DS4_METAL_DISABLE_V41_DRAFT_DEFER") != NULL;
+    return !off;
+}
+
+/* Project and commit the rows deferred while proposals were skipped. */
+static bool ds41_draft_flush(ds41_gpu_graph *g) {
+    ds41_draft *d = g->draft;
+    if (!d || !d->deferred) return true;
+    d->mh_rows = d->deferred;
+    d->deferred = 0;
+    bool ok = ds4_gpu_begin_commands() && ds41_draft_pending(g) && ds41_draft_commit(g, d->mh_rows);
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    return ok;
+}
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
@@ -43433,9 +43451,19 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (draft_queue_off < 0) draft_queue_off = getenv("DS4_METAL_DISABLE_V41_QUEUED_DRAFT_COMMIT") != NULL;
     const bool draft_queued = g->draft && queue_layers && g->tp_world == 1 && !layer_resident &&
         !draft_queue_off;
+    /* While the scheduler skips proposals the drafter's rings are not read:
+     * keep capturing the target streams, but project and commit them in one
+     * batched pass before the next proposal (ds41_draft_flush). */
+    bool draft_defer = false;
     if (g->draft) {
-        g->draft->mh_pos0 = g->pos;
-        g->draft->mh_rows = 1;
+        ds41_draft *d = g->draft;
+        if (!d->deferred || d->mh_pos0 + d->deferred != g->pos) {
+            d->deferred = 0;
+            d->mh_pos0 = g->pos;
+        }
+        d->mh_rows = d->deferred + 1u;
+        draft_defer = ds41_draft_defer_on() && g->tp_world == 1 && d->skip_left > 0 &&
+            d->mh_rows < DS41_DRAFT_WINDOW;
     }
     g->scalar_decode = true;
     g->tp_gate_fused = g->tp_world == 2 && !ds41_tp_gate_expand_off() &&
@@ -43467,7 +43495,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && queued_head && il + 1u == DS4_N_LAYER) ok = ds41_graph_encode_logits(g, m, w);
         /* so does the drafter's projection of the captured streams: it joins
          * the final command buffer instead of a buffer and wait of its own */
-        if (ok && draft_queued && il + 1u == DS4_N_LAYER) ok = ds41_draft_pending(g) && ds41_draft_commit(g, 1);
+        if (ok && draft_queued && !draft_defer && il + 1u == DS4_N_LAYER)
+            ok = ds41_draft_pending(g) && ds41_draft_commit(g, g->draft->mh_rows);
         if (drain && !ds4_gpu_end_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
@@ -43494,10 +43523,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
-    if (ok && g->draft && !draft_queued) {
-        ok = ds4_gpu_begin_commands() && ds41_draft_pending(g) && ds41_draft_commit(g, 1);
+    if (ok && g->draft && !draft_queued && !draft_defer) {
+        ok = ds4_gpu_begin_commands() && ds41_draft_pending(g) && ds41_draft_commit(g, g->draft->mh_rows);
         if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     }
+    if (g->draft) g->draft->deferred = draft_defer ? g->draft->mh_rows : 0u;
     if (ok && logits) ok = queued_head ?
         ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0 :
         ds41_graph_logits(g, m, w, logits);
@@ -43932,6 +43962,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud,
                               bool encoder_only, bool resume_encoder,
                               const int *next_tokens, uint32_t next_count) {
+    if (!ds41_draft_flush(g)) return false;
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
     /* CED replays through the carry, so it needs the wide sweep's storage. */
     /* TP ranks reach the same decision from the same sweep and environment. */
@@ -44567,6 +44598,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 
 static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_weights *w, const int *tokens, uint32_t count) {
+    if (!ds41_draft_flush(g)) return false;
     if (!g->valid || count < 2u || count > DS4_TP_BATCH_MAX_ROWS ||
         g->pos > g->ctx || count > g->ctx - g->pos) return false;
     ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
@@ -62758,6 +62790,7 @@ typedef struct ds4_dspark_spec_stats {
     uint64_t draft_len_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
     uint64_t accepted_len_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
     uint64_t scheduler_skips;
+    uint64_t lookup_cycles;
     uint64_t tail_skips;
     uint64_t verifier_unavailable;
     uint64_t verifier_errors;
@@ -75764,7 +75797,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             "accepted_draft=%llu accept_rate=%.2f%% avg_accept=%.3f seed_batches=%llu "
             "full=%llu partial=%llu direct_full=%llu direct_partial=%llu "
             "replay_fallbacks=%llu miss_first=%llu no_draft=%llu "
-            "no_room=%llu invalid=%llu scheduler_skips=%llu "
+            "no_room=%llu invalid=%llu scheduler_skips=%llu lookup=%llu "
             "tail_skips=%llu verifier_unavailable=%llu errors=%llu time_ms propose=%.3f "
             "prop_stage0=%.3f prop_setup=%.3f prop_cache=%.3f "
             "prop_chain=%.3f prop_hidden=%.3f prop_conf0=%.3f "
@@ -75791,6 +75824,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             (unsigned long long)st->no_room,
             (unsigned long long)st->invalid_draft,
             (unsigned long long)st->scheduler_skips,
+            (unsigned long long)st->lookup_cycles,
             (unsigned long long)st->tail_skips,
             (unsigned long long)st->verifier_unavailable,
             (unsigned long long)st->verifier_errors,
@@ -87629,6 +87663,27 @@ static void ds41_draft_adapt(ds41_draft *d, bool proposed, uint32_t k, uint32_t 
 
 /* One DSpark cycle for a V4.1 session: a block drafted from first_token, verified in
  * one trunk pass, the accepted prefix kept. */
+/* Drafts copied from the context: when the newest `min` tokens (ending with t0)
+ * repeat an earlier stretch, propose what followed its latest occurrence.
+ * Agent traffic re-emits files, diffs and tool output, where a copy is right
+ * more often than the drafter and costs no proposal pass. */
+static uint32_t ds41_lookup_draft(const token_vec *ctx, int t0, uint32_t min, uint32_t max, int *out) {
+    const int n = ctx->len;
+    if (min < 2u || (uint32_t)n < min) return 0;
+    const int *v = ctx->v;
+    /* the pattern is v[n - min + 1 .. n - 1] followed by t0 */
+    for (int j = n - (int)min; j >= 0; j--) {
+        if (v[j + (int)min - 1] != t0) continue;
+        uint32_t i = 0;
+        while (i + 1u < min && v[j + (int)i] == v[n - (int)min + 1 + (int)i]) i++;
+        if (i + 1u < min) continue;
+        uint32_t k = 0;
+        for (int p = j + (int)min; k < max && p < n; p++) out[k++] = v[p];
+        if (k) return k;
+    }
+    return 0;
+}
+
 static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, int eos_token,
                              bool ignore_eos, ds4_think_mode think_mode, float temperature,
                              int top_k, float top_p, float min_p, uint64_t *rng,
@@ -87640,7 +87695,7 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     const bool exact = rng && temperature > 0.0f, stats = ds4_dspark_stats_enabled();
     const double t0 = now_sec();
     int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
-    float conf[DS4_DSPARK_MAX_BLOCK_SIZE];
+    float conf[DS4_DSPARK_MAX_BLOCK_SIZE] = {0};
     uint32_t k = 0;
     double propose_s = 0.0;
     /* the block continues the position whose stream the last pass captured */
@@ -87652,7 +87707,22 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
         d->skip_left--;
         if (stats) s->dspark_stats.scheduler_skips++;
     }
-    if (proposed) {
+    static int lookup_min = -1;   /* DS4_DSPARK_V41_LOOKUP=N: copy drafts after N matching tokens */
+    if (lookup_min < 0) {
+        const char *env = getenv("DS4_DSPARK_V41_LOOKUP");
+        lookup_min = env && *env ? atoi(env) : 0;
+        if (lookup_min < 0) lookup_min = 0;
+    }
+    const uint32_t copied = draftable && lookup_min ?
+        ds41_lookup_draft(&s->checkpoint, first_token, (uint32_t)lookup_min, B, drafts) : 0u;
+    if ((copied || proposed) && !ds41_draft_flush(g)) {
+        payload_set_err(err, errlen, "DeepSeek V4.1 draft flush failed");
+        return -1;
+    }
+    if (copied) {
+        k = copied;
+        if (stats) s->dspark_stats.lookup_cycles++;
+    } else if (proposed) {
         const double tp = now_sec();
         DS41_PHASE("propose");
         ds4_gpu_dsv41_mma_rows(1);
@@ -87666,6 +87736,8 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
         propose_s = now_sec() - tp;
         if (stats) s->dspark_stats.propose_ms += propose_s * 1000.0;
         k = dspark_confident_prefix_len(conf, B, e->dspark_confidence_threshold);
+    }
+    if (k) {
         static int draft_cap = -1;   /* DS4_DSPARK_V41_MAX_DRAFT: depth experiments */
         if (draft_cap < 0) {
             const char *env = getenv("DS4_DSPARK_V41_MAX_DRAFT");
