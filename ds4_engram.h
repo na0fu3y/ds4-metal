@@ -67,4 +67,13 @@ ds4_engram_prefetch *ds4_engram_read_batch_start(const ds4_engram_table *table, 
                                                  size_t tokens, size_t stride, float *out);
 bool ds4_engram_read_batch_finish(ds4_engram_prefetch *prefetch);
 
+/* Background sequential read of [offset, offset + bytes) into the kernel page
+ * cache, so the uncached row readers above hit memory. No table allocation;
+ * stops early at memory pressure. Wait reports whether it covered the span. */
+typedef struct ds4_engram_warm ds4_engram_warm;
+uint64_t ds4_engram_physical_memory(void);
+ds4_engram_warm *ds4_engram_warm_start(const char *path, uint64_t offset, uint64_t bytes);
+bool ds4_engram_warm_wait(ds4_engram_warm *warm, double *seconds);
+void ds4_engram_warm_stop(ds4_engram_warm *warm);
+
 #endif
