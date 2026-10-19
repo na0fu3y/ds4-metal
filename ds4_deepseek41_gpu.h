@@ -265,6 +265,14 @@ int ds4_gpu_dsv41_query_deferred_hc(ds4_gpu_tensor *q, ds4_gpu_tensor *mix, ds4_
         uint32_t iters, float hc_eps, float norm_eps, ds4_gpu_tensor *x, ds4_gpu_tensor *norm,
         const ds4_gpu_tensor *pre, uint64_t norm_offset,
         const ds4_gpu_tensor *kv, ds4_gpu_tensor *cache, uint64_t cache_offset);
+/* The same over q_rows (32768, or a TP rank's 16384) rows from q_offset. */
+int ds4_gpu_dsv41_query_deferred_hc_rows(ds4_gpu_tensor *q, ds4_gpu_tensor *mix, ds4_gpu_tensor *split,
+        const ds4_gpu_tensor *qr, const ds4_gpu_tensor *residual,
+        const void *model_map, uint64_t model_size, uint64_t q_offset, uint32_t q_rows, uint64_t fn_offset,
+        uint64_t scale_offset, uint64_t base_offset, uint32_t pos, bool compressed,
+        uint32_t iters, float hc_eps, float norm_eps, ds4_gpu_tensor *x, ds4_gpu_tensor *norm,
+        const ds4_gpu_tensor *pre, uint64_t norm_offset,
+        const ds4_gpu_tensor *kv, ds4_gpu_tensor *cache, uint64_t cache_offset);
 
 int ds4_gpu_dsv41_project_q(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                             uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
