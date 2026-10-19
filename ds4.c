@@ -40995,6 +40995,8 @@ typedef struct {
 
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
+    /* CED replay: decoder window keys before this position are not visible. */
+    uint32_t window_floor;
     uint64_t allocation_bytes;
     uint64_t passes;                 /* passes that changed the state, for a block rewind */
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
@@ -42681,7 +42683,8 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (start + count) / ratio : 0;
-    const uint32_t previous = start < 127u ? start : 127u;
+    const uint32_t visible = start > g->window_floor ? start - g->window_floor : 0u;
+    const uint32_t previous = visible < 127u ? visible : 127u;
     const uint32_t raw_start = (start - previous) % 128u;
     const uint32_t first = previous < 128u - raw_start ? previous : 128u - raw_start;
     const uint32_t n_raw = previous + count;
@@ -43760,6 +43763,28 @@ static bool ds41_engram_carry_arm(ds41_gpu_graph *g, const int *tokens, uint32_t
     return g->engram_carry.armed[0];
 }
 
+/* CED (the V4.1 report's causal encoder-decoder with SWA bounded replay):
+ * decoder layers 20..39 read global keys published from the encoder output
+ * and only a 128-row window of their own. Replay just the last rows of a
+ * sweep through them, their windows truncated to the replayed segment. The
+ * model was post-trained for this; it is not equal to the full forward. */
+static uint32_t ds41_ced_tail(void) {
+    /* Replay 256 rows, so the last 128 see full windows: half the KL to the
+     * full forward of the report's 128-row replay, ~5% slower on 2K appends.
+     * DS4_V41_CED_TAIL=N picks another length (128 = the report's recipe). */
+    static uint32_t tail;
+    if (!tail) {
+        const char *v = getenv("DS4_V41_CED_TAIL");
+        const long t = v ? strtol(v, NULL, 10) : 256;
+        tail = t >= 128 && t <= 4096 ? (uint32_t)t : 256u;
+    }
+    return tail;
+}
+static bool ds41_ced_on(void) {
+    const char *v = getenv("DS4_V41_CED");
+    return v && v[0] == '1';
+}
+
 static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* Wider encoder tiles amortize weight reads near the next power of two.
@@ -43794,7 +43819,15 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               bool encoder_only, bool resume_encoder,
                               const int *next_tokens, uint32_t next_count) {
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
-    const bool wide = total_count > encoder_chunk;
+    /* CED replays through the carry, so it needs the wide sweep's storage. */
+    /* TP ranks reach the same decision from the same sweep and environment. */
+    const bool ced = ds41_ced_on() && !g->streaming && !g->image_count &&
+        total_count >= ds41_ced_tail() + 256u && total_count <= g->carry_cap;
+    /* DS4_V41_SUFFIX_ALL: the exact dependency suffix for short sweeps too, without
+     * tile rounding; same math, other kernels for the smaller row counts. */
+    const bool suffix_all = !ced && getenv("DS4_V41_SUFFIX_ALL") && g->tp_world == 1 && !g->streaming &&
+        !g->image_count && total_count >= 384u && total_count <= g->carry_cap;
+    const bool wide = total_count > encoder_chunk || ced || suffix_all;
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
         total_count > g->ctx - g->pos || g->imatrix || !ds41_tp_batch_enabled(g))
         return false;
@@ -43808,8 +43841,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC");
     /* Layer 20 keeps 1 + (n_layer - 21) * 127 rows and replays the 127 before them. */
     const uint32_t suffix_rows = 1u + (DS4_N_LAYER - 20u) * 127u;
-    const bool decoder_suffix = wide && total_count >= suffix_rows &&
-        !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
+    const bool decoder_suffix = ced || suffix_all || (wide && total_count >= suffix_rows &&
+        !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX"));
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
     uint32_t (*ids)[2][DS4_ENGRAM_COLS] = g->prefill_ids;
     ds4_engram_history next_history = g->history;
@@ -43920,13 +43953,21 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (il == 20u)
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
+            if (ced) {
+                first = total_count - ds41_ced_tail();
+                g->window_floor = initial_start + first;
+            }
+        }
+        if (ok && decoder_suffix && il >= 20u && !ced) {
             const uint32_t needed = 1u + (DS4_N_LAYER - 1u - il) * 127u;
-            first = total_count - needed;
+            first = needed < total_count ? total_count - needed : 0u;
             /* short sweeps prune whole tiles and warm a complete one, keeping
              * the partitions the plain schedule would have used */
-            const bool short_sweep = total_count < 8192u && !ds41_short_sweep_off();
+            const bool short_sweep = total_count < 8192u && !ds41_short_sweep_off() && !suffix_all;
             if (short_sweep) first -= first % 2048u;
-            const uint32_t warm = short_sweep ? 128u : 127u;
+            uint32_t warm = short_sweep ? 128u : 127u;
+            /* rows before the sweep are already in the window ring */
+            if (warm > first) warm = first;
             if (ok && first) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                 first - warm, warm, false, batch_hc, batch_attention, cancel, cancel_ud);
         }
@@ -44158,6 +44199,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (g->streaming) ds4_gpu_stream_expert_cache_prefetch_finish(true);
 #endif
+    g->window_floor = 0;
     if (!metal_graph_stream_prepare_join_all(&prepare, 1)) ok = false;
     if (g->streaming && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (ok && !encoder_only) {
